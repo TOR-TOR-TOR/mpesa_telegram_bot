@@ -1,9 +1,6 @@
 """
-main.py — Single entry point that runs both the bot and callback server together.
-Starts:
-  - Aiogram bot (polling)
-  - FastAPI callback server (uvicorn on port 8000)
-Both run concurrently in the same async event loop.
+main.py — Single entry point.
+Runs bot + callback server + scheduler together.
 """
 
 import asyncio
@@ -13,6 +10,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from bot.handlers import start, subscription
 from payments.callbacks import app as fastapi_app, set_bot
+from scheduler.jobs import create_scheduler, set_bot as set_scheduler_bot
 from database import init_db
 import config
 
@@ -36,7 +34,7 @@ async def run_server():
         app       = fastapi_app,
         host      = "0.0.0.0",
         port      = config.PORT,
-        log_level = "warning"   # suppress uvicorn noise, we use our own logger
+        log_level = "warning"
     )
     server = uvicorn.Server(server_config)
     await server.serve()
@@ -45,7 +43,7 @@ async def run_server():
 async def main():
     logger.info("🚀 Kilima Bot starting up...")
 
-    # Initialize database tables
+    # Initialize database
     await init_db()
     logger.info("✅ Database ready")
 
@@ -53,21 +51,33 @@ async def main():
     bot = Bot(token=config.BOT_TOKEN)
     dp  = Dispatcher(storage=MemoryStorage())
 
-    # Inject bot into callback server so it can send messages
+    # Inject bot into callback server and scheduler
     set_bot(bot)
-    logger.info("✅ Bot injected into callback server")
+    set_scheduler_bot(bot)
+    logger.info("✅ Bot injected into callback server and scheduler")
 
-    # Register all handlers
+    # Register handlers
     dp.include_router(start.router)
     dp.include_router(subscription.router)
     logger.info("✅ Handlers registered")
 
-    # Run both concurrently
-    logger.info("✅ Launching bot + callback server together...")
-    await asyncio.gather(
-        run_bot(bot, dp),
-        run_server()
-    )
+    # Start scheduler
+    scheduler = create_scheduler()
+    scheduler.start()
+    logger.info("✅ Scheduler started — jobs:")
+    for job in scheduler.get_jobs():
+        logger.info(f"   • {job.name} — next run: {job.next_run_time}")
+
+    # Run bot + callback server together
+    logger.info("✅ Launching bot + callback server...")
+    try:
+        await asyncio.gather(
+            run_bot(bot, dp),
+            run_server()
+        )
+    finally:
+        scheduler.shutdown()
+        logger.info("👋 Scheduler stopped")
 
 
 if __name__ == "__main__":
