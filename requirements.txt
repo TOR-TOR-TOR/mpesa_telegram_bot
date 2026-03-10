@@ -1,0 +1,22 @@
+# Telegram bot
+aiogram==3.13.0
+
+# Web server (for M-Pesa callbacks)
+fastapi==0.111.0
+uvicorn==0.30.1
+
+# HTTP client (for Daraja API)
+httpx==0.27.0
+
+# Database
+sqlalchemy==2.0.31
+aiosqlite==0.20.0        # async SQLite driver
+
+# Scheduler (reminders + expiry jobs)
+apscheduler==3.10.4
+
+# Environment variables
+python-dotenv==1.0.1
+
+# Date/time handling
+python-dateutil==2.9.0
