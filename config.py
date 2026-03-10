@@ -52,19 +52,19 @@ DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./subscriptio
 PLANS: dict = {
     "weekly": {
         "label":         "Weekly",
-        "price":         150,
+        "price":         1,
         "duration_days": 7,
         "description":   "7-day access",
     },
     "monthly": {
         "label":         "Monthly",
-        "price":         500,
+        "price":         2,
         "duration_days": 30,
         "description":   "30-day access",
     },
     "quarterly": {
         "label":         "Quarterly",
-        "price":         1200,
+        "price":         3,
         "duration_days": 90,
         "description":   "90-day access — best value",
     },

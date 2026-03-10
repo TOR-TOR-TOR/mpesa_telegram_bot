@@ -80,11 +80,16 @@ async def stk_push(phone_number: str, amount: int,
             json=payload,
             headers={"Authorization": f"Bearer {token}"}
         )
-    
+
+    # Handle non-200 HTTP responses (e.g. 503 Service Unavailable)
+    if response.status_code != 200:
+        raise Exception(
+            f"Daraja returned HTTP {response.status_code} — "
+            f"sandbox may be temporarily down. Try again in a moment."
+        )
 
     data = response.json()
 
-    # ResponseCode "0" means the STK push was accepted by Daraja
     if data.get("ResponseCode") != "0":
         raise Exception(
             f"STK Push failed: {data.get('ResponseCode')} — "

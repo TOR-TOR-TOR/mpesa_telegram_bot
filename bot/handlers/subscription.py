@@ -20,14 +20,13 @@ router = Router()
 
 # ── FSM States ────────────────────────────────────────────────────────────────
 class SubscriptionStates(StatesGroup):
-    waiting_for_phone   = State()   # user needs to enter their phone number
-    waiting_for_confirm = State()   # user needs to confirm payment details
+    waiting_for_phone   = State()
+    waiting_for_confirm = State()
 
 
 # ── /subscribe command ────────────────────────────────────────────────────────
 @router.message(Command("subscribe"))
 async def cmd_subscribe(message: Message, state: FSMContext):
-    """Show available subscription plans."""
     await state.clear()
 
     async with AsyncSessionLocal() as session:
@@ -60,7 +59,6 @@ async def cmd_subscribe(message: Message, state: FSMContext):
 # ── Plan selected ─────────────────────────────────────────────────────────────
 @router.callback_query(F.data.startswith("plan:"))
 async def on_plan_selected(callback: CallbackQuery, state: FSMContext):
-    """User selected a plan — ask for their phone number."""
     plan_id = callback.data.split(":")[1]
     plan    = config.PLANS.get(plan_id)
 
@@ -68,7 +66,6 @@ async def on_plan_selected(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Invalid plan. Please try again.")
         return
 
-    # Store selected plan in FSM state
     await state.update_data(selected_plan=plan_id)
     await state.set_state(SubscriptionStates.waiting_for_phone)
 
@@ -85,12 +82,10 @@ async def on_plan_selected(callback: CallbackQuery, state: FSMContext):
 # ── Phone number received ─────────────────────────────────────────────────────
 @router.message(SubscriptionStates.waiting_for_phone)
 async def on_phone_received(message: Message, state: FSMContext):
-    """Validate phone number and ask for confirmation."""
     from payments.daraja import format_phone
 
     raw_phone = message.text.strip()
 
-    # Validate phone number
     try:
         formatted_phone = format_phone(raw_phone)
     except ValueError as e:
@@ -102,7 +97,6 @@ async def on_phone_received(message: Message, state: FSMContext):
         )
         return
 
-    # Store phone in FSM state
     data    = await state.get_data()
     plan_id = data.get("selected_plan")
     plan    = config.PLANS.get(plan_id)
@@ -126,15 +120,14 @@ async def on_phone_received(message: Message, state: FSMContext):
 # ── Payment confirmed ─────────────────────────────────────────────────────────
 @router.callback_query(F.data.startswith("confirm:"))
 async def on_payment_confirmed(callback: CallbackQuery, state: FSMContext):
-    """User confirmed — trigger STK Push."""
     from payments.daraja import stk_push
     from database.crud import update_user_phone, create_transaction
     import httpx
 
-    data        = await state.get_data()
-    phone       = data.get("phone")
-    plan_id     = callback.data.split(":")[1]
-    plan        = config.PLANS.get(plan_id)
+    data    = await state.get_data()
+    phone   = data.get("phone")
+    plan_id = callback.data.split(":")[1]
+    plan    = config.PLANS.get(plan_id)
 
     if not phone or not plan:
         await callback.answer("Session expired. Please use /subscribe again.")
@@ -148,7 +141,6 @@ async def on_payment_confirmed(callback: CallbackQuery, state: FSMContext):
     )
 
     try:
-        # Save phone number to user profile
         async with AsyncSessionLocal() as session:
             user = await get_or_create_user(
                 session,
@@ -158,7 +150,6 @@ async def on_payment_confirmed(callback: CallbackQuery, state: FSMContext):
             )
             await update_user_phone(session, callback.from_user.id, phone)
 
-        # Trigger STK Push
         result = await stk_push(
             phone_number = phone,
             amount       = plan["price"],
@@ -168,7 +159,6 @@ async def on_payment_confirmed(callback: CallbackQuery, state: FSMContext):
 
         checkout_request_id = result.get("CheckoutRequestID")
 
-        # Record transaction as pending
         async with AsyncSessionLocal() as session:
             user = await get_or_create_user(
                 session,
@@ -203,18 +193,21 @@ async def on_payment_confirmed(callback: CallbackQuery, state: FSMContext):
         logger.error(f"STK Push error for {callback.from_user.id}: {e}")
         await callback.message.edit_text(
             f"❌ *Payment initiation failed*\n\n"
-            f"Something went wrong. Please try /subscribe again.",
+            f"{e}\n\n"
+            f"Please try /subscribe again in a moment.",
             parse_mode="Markdown"
         )
 
     await state.clear()
-    await callback.answer()
+    try:
+        await callback.answer()
+    except Exception:
+        pass  # callback already expired — harmless
 
 
 # ── Cancel ────────────────────────────────────────────────────────────────────
 @router.callback_query(F.data == "cancel")
 async def on_cancel(callback: CallbackQuery, state: FSMContext):
-    """User cancelled the flow."""
     await state.clear()
     await callback.message.edit_text(
         "❌ *Cancelled.*\n\nUse /subscribe whenever you're ready.",
@@ -225,7 +218,6 @@ async def on_cancel(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "try_again")
 async def on_try_again(callback: CallbackQuery, state: FSMContext):
-    """Redirect user back to plan selection."""
     await state.clear()
     await callback.message.edit_text(
         f"💳 *Choose a Subscription Plan*\n\n"
