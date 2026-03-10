@@ -16,7 +16,11 @@ import config
 
 logging.basicConfig(
     level  = logging.INFO,
-    format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers = [
+        logging.StreamHandler(),                        # terminal
+        logging.FileHandler("bot.log", encoding="utf-8")  # logs saved to file
+    ]
 )
 logger = logging.getLogger(__name__)
 

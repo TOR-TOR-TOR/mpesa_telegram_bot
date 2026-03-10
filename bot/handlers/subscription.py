@@ -39,21 +39,22 @@ async def cmd_subscribe(message: Message, state: FSMContext):
         active_sub = await get_active_subscription(session, user.id)
 
     if active_sub:
-        expiry = active_sub.expires_at.strftime("%d %b %Y")
+        expiry     = active_sub.expires_at.strftime("%d %b %Y")
+        plan_label = config.PLANS.get(active_sub.plan, {}).get("label", active_sub.plan)
         await message.answer(
-            f"✅ You already have an active *{active_sub.plan.title()}* "
-            f"subscription until *{expiry}*.\n\n"
-            f"You can still subscribe below to renew or upgrade:",
-            parse_mode="Markdown",
-            reply_markup=plans_keyboard()
+            f"⚠️ You already have an active subscription!\n\n"
+            f"📦 Plan: {plan_label}\n"
+            f"📅 Expires: {expiry}\n\n"
+            f"You cannot subscribe again until your current plan expires.\n"
+            f"Use /status to check your subscription details."
         )
-    else:
-        await message.answer(
-            f"💳 *Choose a Subscription Plan*\n\n"
-            f"Select the plan that works best for you:",
-            parse_mode="Markdown",
-            reply_markup=plans_keyboard()
-        )
+        return
+
+    await message.answer(
+        f"💳 Choose a Subscription Plan\n\n"
+        f"Select the plan that works best for you:",
+        reply_markup=plans_keyboard()
+    )
 
 
 # ── Plan selected ─────────────────────────────────────────────────────────────
@@ -123,6 +124,7 @@ async def on_payment_confirmed(callback: CallbackQuery, state: FSMContext):
     from payments.daraja import stk_push
     from database.crud import update_user_phone, create_transaction
     import httpx
+    import uuid
 
     data    = await state.get_data()
     phone   = data.get("phone")
@@ -135,9 +137,8 @@ async def on_payment_confirmed(callback: CallbackQuery, state: FSMContext):
         return
 
     await callback.message.edit_text(
-        f"⏳ *Sending M-Pesa prompt...*\n\n"
+        f"⏳ Sending M-Pesa prompt...\n\n"
         f"Please wait while we send the STK push to your phone.",
-        parse_mode="Markdown"
     )
 
     try:
@@ -150,6 +151,25 @@ async def on_payment_confirmed(callback: CallbackQuery, state: FSMContext):
             )
             await update_user_phone(session, callback.from_user.id, phone)
 
+        # ── Generate a temporary checkout ID before STK push ─────────────────
+        # This ensures the transaction exists in DB before Daraja callback arrives
+        temp_checkout_id = f"PENDING_{callback.from_user.id}_{uuid.uuid4().hex[:8]}"
+
+        async with AsyncSessionLocal() as session:
+            user = await get_or_create_user(
+                session,
+                telegram_id = callback.from_user.id
+            )
+            txn = await create_transaction(
+                session,
+                user_id             = user.id,
+                plan                = plan_id,
+                amount              = plan["price"],
+                phone_number        = phone,
+                checkout_request_id = temp_checkout_id
+            )
+
+        # ── Now send STK Push ─────────────────────────────────────────────────
         result = await stk_push(
             phone_number = phone,
             amount       = plan["price"],
@@ -157,52 +177,46 @@ async def on_payment_confirmed(callback: CallbackQuery, state: FSMContext):
             description  = f"{plan['label']} Subscription"
         )
 
-        checkout_request_id = result.get("CheckoutRequestID")
+        real_checkout_id = result.get("CheckoutRequestID")
 
+        # ── Update transaction with real CheckoutRequestID from Daraja ────────
         async with AsyncSessionLocal() as session:
-            user = await get_or_create_user(
-                session,
-                telegram_id = callback.from_user.id
+            from sqlalchemy import update
+            from database.models import Transaction
+            await session.execute(
+                update(Transaction)
+                .where(Transaction.checkout_request_id == temp_checkout_id)
+                .values(checkout_request_id=real_checkout_id)
             )
-            await create_transaction(
-                session,
-                user_id             = user.id,
-                plan                = plan_id,
-                amount              = plan["price"],
-                phone_number        = phone,
-                checkout_request_id = checkout_request_id
-            )
+            await session.commit()
 
         await callback.message.edit_text(
-            f"📲 *M-Pesa Prompt Sent!*\n\n"
+            f"📲 M-Pesa Prompt Sent!\n\n"
             f"Check your phone and enter your M-Pesa PIN to complete payment.\n\n"
-            f"💰 Amount: *KES {plan['price']}*\n"
-            f"📱 Phone: *{phone}*\n\n"
-            f"_You have 60 seconds to complete the payment._",
-            parse_mode="Markdown"
+            f"💰 Amount: KES {plan['price']}\n"
+            f"📱 Phone: {phone}\n\n"
+            f"You have 60 seconds to complete the payment."
         )
 
     except (httpx.ConnectTimeout, httpx.ReadTimeout):
         await callback.message.edit_text(
-            f"⚠️ *Request timed out*\n\n"
+            f"⚠️ Request timed out\n\n"
             f"The M-Pesa server took too long to respond. Please try again.",
-            parse_mode="Markdown",
             reply_markup=confirm_payment_keyboard(plan_id)
         )
     except Exception as e:
         logger.error(f"STK Push error for {callback.from_user.id}: {e}")
         await callback.message.edit_text(
-            f"❌ *Payment initiation failed*\n\n"
+            f"❌ Payment initiation failed\n\n"
             f"{e}\n\n"
-            f"Please try /subscribe again in a moment.",
-            parse_mode="Markdown"
+            f"Please try /subscribe again in a moment."
         )
 
     await state.clear()
     try:
         await callback.answer()
     except Exception:
-        pass  # callback already expired — harmless
+        pass
 
 
 # ── Cancel ────────────────────────────────────────────────────────────────────

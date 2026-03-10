@@ -152,22 +152,31 @@ async def cmd_subscribers(message: Message):
 
     lines = []
     for sub, user in rows:
-        expiry    = sub.expires_at.strftime("%d %b %Y")
-        plan      = config.PLANS.get(sub.plan, {}).get("label", sub.plan)
-        name      = user.full_name or "Unknown"
-        username  = f"@{user.username}" if user.username else str(user.telegram_id)
+        expiry   = sub.expires_at.strftime("%d %b %Y")
+        plan     = config.PLANS.get(sub.plan, {}).get("label", sub.plan)
+        name     = (user.full_name or "Unknown").replace("_", " ")
+        username = f"@{user.username}" if user.username else str(user.telegram_id)
+
         lines.append(f"• {name} ({username})\n  {plan} — expires {expiry}")
 
-    # Telegram has a 4096 char limit — chunk if needed
-    chunk = f"👥 *Active Subscribers ({len(rows)})*\n\n"
-    for line in lines:
-        if len(chunk) + len(line) > 3900:
-            await message.answer(chunk, parse_mode="Markdown")
-            chunk = ""
-        chunk += line + "\n\n"
+    # Build plain text response — no Markdown to avoid parse errors
+    header = f"👥 Active Subscribers ({len(rows)})\n\n"
+    body   = "\n\n".join(lines)
 
-    if chunk:
-        await message.answer(chunk, parse_mode="Markdown")
+    full_text = header + body
+
+    # Chunk if over 4096 chars
+    if len(full_text) <= 4096:
+        await message.answer(full_text)
+    else:
+        chunk = header
+        for line in lines:
+            if len(chunk) + len(line) > 3900:
+                await message.answer(chunk)
+                chunk = ""
+            chunk += line + "\n\n"
+        if chunk:
+            await message.answer(chunk)
 
 
 # ── /grant ────────────────────────────────────────────────────────────────────

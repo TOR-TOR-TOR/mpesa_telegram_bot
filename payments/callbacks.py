@@ -20,8 +20,6 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# Bot instance injected at startup from main.py
-# We need it here to send Telegram notifications after payment
 _bot = None
 
 def set_bot(bot_instance):
@@ -45,36 +43,12 @@ async def health_check():
 
 @app.post("/payments/callback")
 async def mpesa_callback(request: Request):
-    """
-    Main M-Pesa callback endpoint.
-    Daraja POSTs here after every STK Push attempt (success or failure).
-
-    Expected payload structure from Daraja:
-    {
-        "Body": {
-            "stkCallback": {
-                "MerchantRequestID": "...",
-                "CheckoutRequestID": "ws_CO_...",
-                "ResultCode": 0,         ← 0 = success, anything else = failed
-                "ResultDesc": "...",
-                "CallbackMetadata": {    ← only present on success
-                    "Item": [
-                        {"Name": "Amount", "Value": 1.0},
-                        {"Name": "MpesaReceiptNumber", "Value": "ABC123"},
-                        {"Name": "PhoneNumber", "Value": 254712345678}
-                    ]
-                }
-            }
-        }
-    }
-    """
     try:
         body = await request.json()
         logger.info(f"📩 Callback received: {body}")
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-    # Navigate to the callback data
     try:
         stk_callback = body["Body"]["stkCallback"]
     except KeyError:
@@ -97,63 +71,109 @@ async def mpesa_callback(request: Request):
                 session, checkout_request_id, status="failed"
             )
 
-            # Notify user their payment failed
             if txn and _bot:
                 await _notify_user_failed(txn, result_desc)
 
             return JSONResponse({"ResultCode": 0, "ResultDesc": "Accepted"})
 
         # ── Payment Successful ────────────────────────────────────────────────
-        # Extract metadata from callback
-        metadata    = stk_callback.get("CallbackMetadata", {}).get("Item", [])
-        meta_dict   = {item["Name"]: item.get("Value") for item in metadata}
+        metadata      = stk_callback.get("CallbackMetadata", {}).get("Item", [])
+        meta_dict     = {item["Name"]: item.get("Value") for item in metadata}
 
-        amount          = meta_dict.get("Amount")
-        mpesa_receipt   = meta_dict.get("MpesaReceiptNumber")
-        phone           = meta_dict.get("PhoneNumber")
+        amount        = meta_dict.get("Amount")
+        mpesa_receipt = meta_dict.get("MpesaReceiptNumber")
+        phone         = meta_dict.get("PhoneNumber")
 
         logger.info(
             f"✅ Payment success | Receipt: {mpesa_receipt} | "
             f"Amount: {amount} | Phone: {phone}"
         )
 
-        # Update transaction to success
-        txn = await update_transaction_status(
-            session,
-            checkout_request_id,
-            status="success",
-            mpesa_receipt=str(mpesa_receipt) if mpesa_receipt else None
+        # ── Fetch transaction first before any other logic ────────────────────
+        txn_result = await session.execute(
+            select(Transaction).where(
+                Transaction.checkout_request_id == checkout_request_id
+            )
         )
+        txn = txn_result.scalar_one_or_none()
 
         if not txn:
             logger.error(f"Transaction not found for ID: {checkout_request_id}")
             return JSONResponse({"ResultCode": 0, "ResultDesc": "Accepted"})
 
-        # Fetch the user
-        result  = await session.execute(
+        # Update transaction to success
+        txn.status        = "success"
+        txn.mpesa_receipt = str(mpesa_receipt) if mpesa_receipt else None
+        await session.commit()
+
+        # ── Fetch the user ────────────────────────────────────────────────────
+        result = await session.execute(
             select(User).where(User.id == txn.user_id)
         )
-        user    = result.scalar_one_or_none()
+        user = result.scalar_one_or_none()
 
         if not user:
             logger.error(f"User not found for transaction: {txn.id}")
             return JSONResponse({"ResultCode": 0, "ResultDesc": "Accepted"})
 
-        # Deactivate any existing subscription first
+        # ── Block: check if user already has an active subscription ──────────
         existing = await get_active_subscription(session, user.id)
         if existing:
-            existing.is_active = False
-            await session.commit()
+            expiry_str = existing.expires_at.strftime("%d %b %Y")
+            plan_label = config.PLANS.get(existing.plan, {}).get("label", existing.plan)
 
-        # Create new subscription
+            logger.warning(
+                f"⚠️ Duplicate payment blocked | User: {user.telegram_id} | "
+                f"Existing plan: {existing.plan} | Expires: {existing.expires_at}"
+            )
+
+            # Notify user
+            if _bot:
+                try:
+                    await _bot.send_message(
+                        chat_id = user.telegram_id,
+                        text    = (
+                            f"⚠️ Duplicate Payment Detected\n\n"
+                            f"You already have an active {plan_label} subscription "
+                            f"valid until {expiry_str}.\n\n"
+                            f"Your payment of KES {amount} "
+                            f"(Receipt: {mpesa_receipt}) "
+                            f"has been received but will be refunded.\n\n"
+                            f"Please contact support if you need help.\n"
+                            f"Your current access remains active."
+                        )
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to notify user of duplicate: {e}")
+
+            # Notify admin
+            if _bot:
+                try:
+                    await _bot.send_message(
+                        chat_id = config.ADMIN_ID,
+                        text    = (
+                            f"⚠️ Duplicate Payment Alert\n\n"
+                            f"User: {user.full_name} ({user.telegram_id})\n"
+                            f"Receipt: {mpesa_receipt}\n"
+                            f"Amount: KES {amount}\n"
+                            f"Existing plan: {plan_label} until {expiry_str}\n\n"
+                            f"Please process a refund for this user."
+                        )
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to notify admin of duplicate: {e}")
+
+            return JSONResponse({"ResultCode": 0, "ResultDesc": "Accepted"})
+
+        # ── No existing subscription — create new one ─────────────────────────
         plan_config = config.PLANS.get(txn.plan, {})
         duration    = plan_config.get("duration_days", 30)
 
         sub = await create_subscription(
             session,
-            user_id      = user.id,
-            plan         = txn.plan,
-            duration_days= duration
+            user_id       = user.id,
+            plan          = txn.plan,
+            duration_days = duration
         )
 
         logger.info(
@@ -161,41 +181,36 @@ async def mpesa_callback(request: Request):
             f"Plan: {txn.plan} | Expires: {sub.expires_at}"
         )
 
-        # Grant channel access and notify user
         if _bot:
             await _grant_access_and_notify(user, txn, sub, mpesa_receipt)
 
-    # Always return 200 to Daraja — if we return anything else
-    # Daraja will keep retrying the callback
     return JSONResponse({"ResultCode": 0, "ResultDesc": "Accepted"})
 
 
 async def _grant_access_and_notify(user, txn, sub, mpesa_receipt):
     """Generate invite link and notify user of successful payment."""
     try:
-        # Generate a one-time invite link to the private channel
         invite = await _bot.create_chat_invite_link(
-            chat_id     = config.CHANNEL_ID,
-            member_limit= 1       # single use
+            chat_id      = config.CHANNEL_ID,
+            member_limit = 1
         )
 
         expiry_str = sub.expires_at.strftime("%d %b %Y")
         plan_label = config.PLANS.get(txn.plan, {}).get("label", txn.plan)
 
         message = (
-            f"✅ *Payment Confirmed!*\n\n"
-            f"🧾 Receipt: `{mpesa_receipt}`\n"
-            f"📦 Plan: *{plan_label}*\n"
-            f"📅 Access until: *{expiry_str}*\n\n"
+            f"✅ Payment Confirmed!\n\n"
+            f"🧾 Receipt: {mpesa_receipt}\n"
+            f"📦 Plan: {plan_label}\n"
+            f"📅 Access until: {expiry_str}\n\n"
             f"👇 Click below to join the channel:\n"
             f"{invite.invite_link}\n\n"
-            f"_This link is single-use. Do not share it._"
+            f"This link is single-use. Do not share it."
         )
 
         await _bot.send_message(
-            chat_id    = user.telegram_id,
-            text       = message,
-            parse_mode = "Markdown"
+            chat_id = user.telegram_id,
+            text    = message
         )
 
     except Exception as e:
@@ -211,20 +226,18 @@ async def _notify_user_failed(txn, reason: str):
             "2001": "Wrong PIN entered — please try again.",
         }
 
-        # Extract code from reason string if present
         friendly = next(
             (msg for code, msg in reason_map.items() if code in str(reason)),
             "Your payment could not be completed. Please try again."
         )
 
         await _bot.send_message(
-            chat_id    = txn.user_id,
-            text       = (
-                f"❌ *Payment Failed*\n\n"
+            chat_id = txn.user_id,
+            text    = (
+                f"❌ Payment Failed\n\n"
                 f"{friendly}\n\n"
                 f"Type /subscribe to try again."
-            ),
-            parse_mode = "Markdown"
+            )
         )
     except Exception as e:
         logger.error(f"Failed to notify user of failed payment: {e}")
