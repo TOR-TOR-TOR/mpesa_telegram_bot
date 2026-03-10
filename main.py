@@ -8,7 +8,7 @@ import logging
 import uvicorn
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
-from bot.handlers import start, subscription
+from bot.handlers import start, subscription, admin
 from payments.callbacks import app as fastapi_app, set_bot
 from scheduler.jobs import create_scheduler, set_bot as set_scheduler_bot
 from database import init_db
@@ -59,6 +59,7 @@ async def main():
     # Register handlers
     dp.include_router(start.router)
     dp.include_router(subscription.router)
+    dp.include_router(admin.router)
     logger.info("✅ Handlers registered")
 
     # Start scheduler
