@@ -10,7 +10,8 @@ from database import AsyncSessionLocal, init_db
 from database.crud import (
     update_transaction_status,
     create_subscription,
-    get_active_subscription
+    get_active_subscription,
+    get_user_by_id
 )
 from database.models import Transaction, User
 from sqlalchemy import select
@@ -23,21 +24,18 @@ app = FastAPI()
 _bot = None
 
 def set_bot(bot_instance):
-    """Called from main.py to inject the bot into this module."""
     global _bot
     _bot = bot_instance
 
 
 @app.on_event("startup")
 async def startup():
-    """Initialize database tables when server starts."""
     await init_db()
     logger.info("✅ Callback server started — DB initialized")
 
 
 @app.get("/health")
 async def health_check():
-    """Simple health check endpoint."""
     return {"status": "ok", "service": "mpesa-callback-server"}
 
 
@@ -72,7 +70,10 @@ async def mpesa_callback(request: Request):
             )
 
             if txn and _bot:
-                await _notify_user_failed(txn, result_desc)
+                # Fix 1 — fetch user to get real telegram_id
+                user = await get_user_by_id(session, txn.user_id)
+                if user:
+                    await _notify_user_failed(user.telegram_id, result_desc)
 
             return JSONResponse({"ResultCode": 0, "ResultDesc": "Accepted"})
 
@@ -89,7 +90,7 @@ async def mpesa_callback(request: Request):
             f"Amount: {amount} | Phone: {phone}"
         )
 
-        # ── Fetch transaction first before any other logic ────────────────────
+        # Fetch transaction first
         txn_result = await session.execute(
             select(Transaction).where(
                 Transaction.checkout_request_id == checkout_request_id
@@ -106,17 +107,14 @@ async def mpesa_callback(request: Request):
         txn.mpesa_receipt = str(mpesa_receipt) if mpesa_receipt else None
         await session.commit()
 
-        # ── Fetch the user ────────────────────────────────────────────────────
-        result = await session.execute(
-            select(User).where(User.id == txn.user_id)
-        )
-        user = result.scalar_one_or_none()
+        # Fetch user
+        user = await get_user_by_id(session, txn.user_id)
 
         if not user:
             logger.error(f"User not found for transaction: {txn.id}")
             return JSONResponse({"ResultCode": 0, "ResultDesc": "Accepted"})
 
-        # ── Block: check if user already has an active subscription ──────────
+        # ── Block duplicate ───────────────────────────────────────────────────
         existing = await get_active_subscription(session, user.id)
         if existing:
             expiry_str = existing.expires_at.strftime("%d %b %Y")
@@ -127,7 +125,6 @@ async def mpesa_callback(request: Request):
                 f"Existing plan: {existing.plan} | Expires: {existing.expires_at}"
             )
 
-            # Notify user
             if _bot:
                 try:
                     await _bot.send_message(
@@ -146,7 +143,6 @@ async def mpesa_callback(request: Request):
                 except Exception as e:
                     logger.error(f"Failed to notify user of duplicate: {e}")
 
-            # Notify admin
             if _bot:
                 try:
                     await _bot.send_message(
@@ -165,7 +161,25 @@ async def mpesa_callback(request: Request):
 
             return JSONResponse({"ResultCode": 0, "ResultDesc": "Accepted"})
 
-        # ── No existing subscription — create new one ─────────────────────────
+        # ── Fix 5 — Check CHANNEL_ID is configured ────────────────────────────
+        if config.CHANNEL_ID == 0:
+            logger.error("CHANNEL_ID is not configured — cannot grant access")
+            if _bot:
+                try:
+                    await _bot.send_message(
+                        chat_id = config.ADMIN_ID,
+                        text    = (
+                            f"🚨 CHANNEL_ID not configured!\n\n"
+                            f"User {user.telegram_id} paid KES {amount} "
+                            f"(Receipt: {mpesa_receipt}) but cannot be granted "
+                            f"access because CHANNEL_ID=0.\n\n"
+                            f"Please set CHANNEL_ID in your .env file."
+                        )
+                    )
+                except Exception:
+                    pass
+
+        # ── Create subscription ───────────────────────────────────────────────
         plan_config = config.PLANS.get(txn.plan, {})
         duration    = plan_config.get("duration_days", 30)
 
@@ -190,6 +204,11 @@ async def mpesa_callback(request: Request):
 async def _grant_access_and_notify(user, txn, sub, mpesa_receipt):
     """Generate invite link and notify user of successful payment."""
     try:
+        # Fix 5 — skip invite if channel not configured
+        if config.CHANNEL_ID == 0:
+            logger.warning("Skipping invite link — CHANNEL_ID not set")
+            return
+
         invite = await _bot.create_chat_invite_link(
             chat_id      = config.CHANNEL_ID,
             member_limit = 1
@@ -217,8 +236,9 @@ async def _grant_access_and_notify(user, txn, sub, mpesa_receipt):
         logger.error(f"Failed to grant access to {user.telegram_id}: {e}")
 
 
-async def _notify_user_failed(txn, reason: str):
+async def _notify_user_failed(telegram_id: int, reason: str):
     """Notify user their payment failed."""
+    # Fix 1 — accepts telegram_id directly instead of txn object
     try:
         reason_map = {
             "1032": "You cancelled the payment request.",
@@ -232,7 +252,7 @@ async def _notify_user_failed(txn, reason: str):
         )
 
         await _bot.send_message(
-            chat_id = txn.user_id,
+            chat_id = telegram_id,
             text    = (
                 f"❌ Payment Failed\n\n"
                 f"{friendly}\n\n"

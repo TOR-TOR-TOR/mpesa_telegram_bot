@@ -129,3 +129,10 @@ async def update_transaction_status(session: AsyncSession, checkout_request_id: 
         await session.commit()
 
     return txn
+
+async def get_user_by_id(session: AsyncSession, user_id: int) -> User | None:
+    """Fetch user by database ID."""
+    result = await session.execute(
+        select(User).where(User.id == user_id)
+    )
+    return result.scalar_one_or_none()

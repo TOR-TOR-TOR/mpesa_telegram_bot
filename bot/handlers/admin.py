@@ -22,7 +22,7 @@ from sqlalchemy import select, func
 from database import AsyncSessionLocal
 from database.models import User, Subscription, Transaction
 from database.crud import create_subscription, get_active_subscription
-from scheduler.jobs import _kick_from_channel
+from scheduler.jobs import _kick_from_channel, _notify_expired
 import config
 
 logger = logging.getLogger(__name__)
@@ -323,6 +323,7 @@ async def cmd_revoke(message: Message):
 
     # Kick from channel
     await _kick_from_channel(user)
+    await _notify_expired(user)
 
     # Notify user
     try:

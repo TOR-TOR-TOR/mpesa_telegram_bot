@@ -240,3 +240,18 @@ async def on_try_again(callback: CallbackQuery, state: FSMContext):
         reply_markup=plans_keyboard()
     )
     await callback.answer()
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    """Fix 4 — Allow users to cancel subscription flow at any point."""
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.answer(
+            "Nothing to cancel. Use /subscribe to start."
+        )
+        return
+    await state.clear()
+    await message.answer(
+        "❌ Cancelled.\n\nUse /subscribe whenever you're ready."
+    )

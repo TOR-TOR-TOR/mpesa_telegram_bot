@@ -90,3 +90,10 @@ async def cmd_help(message: Message):
         f"💬 For support, contact @yoursupporthandle",
         parse_mode="Markdown"
     )
+
+@router.message(Command("id"))
+async def cmd_id(message: Message):
+    """Fix 6 — Let users find their Telegram ID."""
+    await message.answer(
+        f"Your Telegram ID is: {message.from_user.id}"
+    )
